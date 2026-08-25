@@ -1,45 +1,203 @@
 """
-ИИ-ассистент по документу (RAG) — веб-приложение.
-Итоговая аттестация. Тема 4: ИИ-агенты и no-code автоматизация.
-Автор: Азизов Игорь Алексеевич. Казань, 2026.
+ИИ-ассистент по документу (RAG) — веб-приложение (один файл).
+Итоговая аттестация. Тема 3: Web-приложения — разработка, расширение
+функционала и деплой. Автор: Азизов Игорь Алексеевич. Казань, 2026.
 
 Как работает:
-  1. Пользователь загружает PDF-документ (инструкцию, регламент).
-  2. Приложение извлекает текст, делит его на фрагменты (чанки) и индексирует (TF-IDF).
-  3. По вопросу пользователя находятся самые релевантные фрагменты (retrieval).
-  4. Языковая модель (Groq LLM) формирует ответ СТРОГО по найденным фрагментам (generation).
+  1. Пользователь загружает PDF-документ (инструкцию, регламент, справочник).
+  2. Приложение извлекает текст, делит его на фрагменты (чанки) и индексирует.
+  3. По вопросу пользователя находятся релевантные фрагменты (retrieval).
+  4. Языковая модель (Groq LLM) формирует ответ СТРОГО по найденным фрагментам.
   Если ответа в документе нет — ассистент честно об этом сообщает.
+
+Весь код собран в одном файле намеренно: так Streamlit при каждом обновлении
+гарантированно перечитывает свежую версию (отдельный модуль он кэширует в памяти).
 """
+import re
+import io
+
 import streamlit as st
 from groq import Groq
+from pypdf import PdfReader
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.metrics.pairwise import cosine_similarity
+from sklearn.pipeline import FeatureUnion
 
-from rag_core import (
-    extract_text_from_pdf,
-    split_into_chunks,
-    Retriever,
-    generate_answer,
+# Метка версии — видно на странице, чтобы всегда точно знать, какой код запущен.
+APP_VERSION = "v2 (reasoning off)"
+
+# ==========================================================================
+#  ЧАСТЬ 1. ЛОГИКА RAG
+# ==========================================================================
+
+# ---------- Извлечение текста из PDF ----------
+def extract_text_from_pdf(file_obj) -> str:
+    reader = PdfReader(file_obj)
+    return "\n".join((page.extract_text() or "") for page in reader.pages)
+
+
+# ---------- Деление текста на фрагменты (чанки) ----------
+HEADING_RE = re.compile(r"(?m)^\s*\d{1,2}\.\s+\S")  # заголовок пункта: "1. Название"
+MAX_SECTION_LEN = 1200
+
+
+def _split_by_sentences(text, chunk_size, overlap):
+    """Запасной способ: деление по предложениям (для текста без нумерации)."""
+    sentences = [s.strip() for s in re.split(r"(?<=[.!?])\s+|\n+", text) if s.strip()]
+    chunks, current = [], ""
+    for sent in sentences:
+        if len(current) + len(sent) + 1 <= chunk_size:
+            current = (current + " " + sent).strip()
+        else:
+            if current:
+                chunks.append(current)
+            tail = current[-overlap:] if overlap and current else ""
+            current = (tail + " " + sent).strip()
+    if current:
+        chunks.append(current)
+    return chunks
+
+
+def split_into_chunks(text, chunk_size=350, overlap=80):
+    """
+    Делит документ на смысловые фрагменты. Основной режим — по нумерованным
+    пунктам (каждый пункт целиком). Если нумерации нет — по предложениям.
+    """
+    text = re.sub(r"[ \t]+", " ", text)
+    text = re.sub(r"\n{2,}", "\n", text).strip()
+    if not text:
+        return []
+
+    starts = [m.start() for m in HEADING_RE.finditer(text)]
+    if len(starts) < 2:
+        return _split_by_sentences(text, chunk_size, overlap)
+
+    chunks = []
+    preamble = text[:starts[0]].strip()
+    if preamble:
+        chunks.append(preamble)
+
+    borders = starts + [len(text)]
+    for i in range(len(starts)):
+        section = " ".join(text[borders[i]:borders[i + 1]].split())
+        if not section:
+            continue
+        if len(section) <= MAX_SECTION_LEN:
+            chunks.append(section)
+        else:
+            heading = section.split(".")[0] + "."
+            for part in _split_by_sentences(section, chunk_size, overlap):
+                chunks.append(part if part.startswith(heading) else f"{heading} {part}")
+    return chunks
+
+
+# ---------- Поиск релевантных фрагментов ----------
+class Retriever:
+    """
+    Индексирует фрагменты через TF-IDF и ищет самые похожие на вопрос.
+    Два взгляда на текст: по словам (точные термины) и по символам
+    (устойчивость к русским словоформам: «функцию» находит «функция»).
+    """
+    def __init__(self, chunks):
+        self.chunks = chunks
+        self.vectorizer = FeatureUnion([
+            ("words", TfidfVectorizer(
+                lowercase=True, analyzer="word",
+                ngram_range=(1, 2), token_pattern=r"(?u)\b\w\w+\b")),
+            ("chars", TfidfVectorizer(
+                lowercase=True, analyzer="char_wb", ngram_range=(3, 5))),
+        ])
+        self.matrix = self.vectorizer.fit_transform(chunks)
+
+    def search(self, query, top_k=3):
+        q_vec = self.vectorizer.transform([query])
+        sims = cosine_similarity(q_vec, self.matrix).ravel()
+        top_idx = sims.argsort()[::-1][:top_k]
+        return [(self.chunks[i], float(sims[i])) for i in top_idx]
+
+
+# ---------- Генерация ответа через Groq ----------
+SYSTEM_PROMPT = (
+    "Ты — ассистент, который отвечает на вопросы СТРОГО по приведённому "
+    "КОНТЕКСТУ из документа.\n"
+    "Правила:\n"
+    "1. Используй только сведения из контекста. Никаких собственных знаний.\n"
+    "2. Если в контексте нет прямого ответа на заданный вопрос — ответь ровно "
+    "одной фразой: «В документе нет информации по этому вопросу». "
+    "Не угадывай и не отвечай частично.\n"
+    "3. Не выдумывай факты, цифры, сроки и названия.\n"
+    "4. Если в контексте есть пример кода, подходящий к вопросу — приведи его "
+    "полностью, как он записан в документе, оформив блоком кода. Не сокращай "
+    "и не переписывай код по-своему.\n"
+    "5. Отвечай кратко, по-русски, деловым языком."
 )
 
-# Минимальная релевантность фрагмента, при которой имеет смысл обращаться
-# к языковой модели. Если ни один фрагмент не набрал столько — вопрос явно
-# не по документу, и ассистент говорит об этом сразу, не тратя запрос.
-#
-# Значение подобрано по замерам на тестовых документах: настоящие вопросы
-# набирали от 0.136, посторонние — до 0.184. Диапазоны частично перекрываются,
-# поэтому порог намеренно занижен: он служит страховкой от совсем чужих
-# вопросов и НИКОГДА не блокирует осмысленный. Основную защиту от выдумывания
-# несёт системный промпт, который требует отвечать только по контексту.
+PRIMARY_MODEL = "qwen/qwen3.6-27b"
+FALLBACK_MODEL = "openai/gpt-oss-20b"
+MAX_ANSWER_TOKENS = 800
+
+
+def build_user_prompt(context, question):
+    return (f"КОНТЕКСТ (фрагменты документа):\n{context}\n\n"
+            f"ВОПРОС: {question}\n\nОтветь только по контексту выше.")
+
+
+def clean_answer(raw):
+    """Убирает блок размышлений <think>...</think> на случай, если он появится."""
+    text = (raw or "").strip()
+    if "</think>" in text:
+        text = text.rsplit("</think>", 1)[1].strip()
+    elif "<think>" in text:
+        text = text.split("<think>", 1)[0].strip()
+    return text
+
+
+def generate_answer(groq_client, question, retrieved):
+    """Две попытки: основная модель с выключенными размышлениями, затем запасная."""
+    context = "\n\n---\n\n".join(chunk for chunk, score in retrieved)
+    messages = [
+        {"role": "system", "content": SYSTEM_PROMPT},
+        {"role": "user", "content": build_user_prompt(context, question)},
+    ]
+
+    # Попытка 1: Qwen с полностью выключенным режимом размышлений
+    try:
+        resp = groq_client.chat.completions.create(
+            messages=messages, model=PRIMARY_MODEL,
+            temperature=0.1, max_tokens=MAX_ANSWER_TOKENS,
+            reasoning_effort="none",
+        )
+        answer = clean_answer(resp.choices[0].message.content)
+        if answer:
+            return answer
+    except Exception:
+        pass
+
+    # Попытка 2: запасная модель (не «размышляет» по умолчанию)
+    resp = groq_client.chat.completions.create(
+        messages=messages, model=FALLBACK_MODEL,
+        temperature=0.1, max_tokens=MAX_ANSWER_TOKENS,
+    )
+    answer = clean_answer(resp.choices[0].message.content)
+    return answer or "Не удалось получить ответ от модели. Попробуйте ещё раз."
+
+
+# Порог релевантности: если ни один фрагмент не набрал столько — вопрос явно
+# не по документу. Подобран по замерам: реальные вопросы от 0.136, посторонние
+# до 0.184; порог занижен, чтобы не блокировать осмысленные вопросы.
 RELEVANCE_THRESHOLD = 0.08
 
-# ---------- Настройка страницы ----------
+
+# ==========================================================================
+#  ЧАСТЬ 2. ИНТЕРФЕЙС
+# ==========================================================================
 st.set_page_config(page_title="ИИ-ассистент по документу (RAG)", page_icon="🤖", layout="centered")
 
 st.title("🤖 ИИ-ассистент по документу")
-st.caption("RAG-агент: отвечает на вопросы строго по загруженному документу. "
-           "Итоговая аттестация · Азизов И. А. · Казань, 2026")
+st.caption(f"RAG-агент: отвечает на вопросы строго по загруженному документу. "
+           f"Итоговая аттестация · Азизов И. А. · Казань, 2026 · {APP_VERSION}")
 
-# ---------- Получение API-ключа Groq ----------
-# Ключ хранится в секретах Streamlit (Settings → Secrets), а НЕ в коде.
+
 def get_groq_client():
     api_key = None
     try:
@@ -47,12 +205,12 @@ def get_groq_client():
     except Exception:
         api_key = None
     if not api_key:
-        st.error("Не найден GROQ_API_KEY. Добавьте его в Settings → Secrets вашего приложения "
-                 "в формате:  GROQ_API_KEY = \"ваш_ключ\"")
+        st.error("Не найден GROQ_API_KEY. Добавьте его в Settings → Secrets: "
+                 'GROQ_API_KEY = "ваш_ключ"')
         st.stop()
     return Groq(api_key=api_key)
 
-# ---------- Боковая панель: как пользоваться ----------
+
 with st.sidebar:
     st.header("Как пользоваться")
     st.markdown(
@@ -64,32 +222,28 @@ with st.sidebar:
     )
     st.divider()
     top_k = st.slider("Сколько фрагментов искать (top-k)", 1, 6, 3)
-    st.caption("Модель: Qwen 3.6-27B через Groq API")
+    st.caption(f"Модель: Qwen 3.6-27B через Groq API · {APP_VERSION}")
 
-# ---------- Загрузка документа ----------
-uploaded = st.file_uploader("📄 Загрузите PDF-документ", type=["pdf"])
 
-# Кэшируем обработку документа, чтобы не пересчитывать при каждом вопросе.
 @st.cache_data(show_spinner=False)
 def process_document(file_bytes):
-    import io
     text = extract_text_from_pdf(io.BytesIO(file_bytes))
-    chunks = split_into_chunks(text)
-    return text, chunks
+    return text, split_into_chunks(text)
+
+
+uploaded = st.file_uploader("📄 Загрузите PDF-документ", type=["pdf"])
 
 if uploaded is not None:
-    file_bytes = uploaded.getvalue()
     with st.spinner("Обрабатываю документ…"):
-        text, chunks = process_document(file_bytes)
+        text, chunks = process_document(uploaded.getvalue())
 
     if not chunks:
-        st.error("Не удалось извлечь текст из PDF. Возможно, это скан (картинка) без текстового слоя.")
+        st.error("Не удалось извлечь текст из PDF. Возможно, это скан без текстового слоя.")
         st.stop()
 
     retriever = Retriever(chunks)
     st.success(f"Документ обработан ✅  Символов: {len(text)}, фрагментов: {len(chunks)}")
 
-    # ---------- Вопрос пользователя ----------
     question = st.text_input("❓ Ваш вопрос по документу:",
                              placeholder="Например: как сбросить пароль?")
 
@@ -97,9 +251,6 @@ if uploaded is not None:
         client = get_groq_client()
         with st.spinner("Ищу ответ в документе…"):
             retrieved = retriever.search(question, top_k=top_k)
-
-            # Защита от галлюцинаций: если ни один фрагмент не релевантен
-            # вопросу, не обращаемся к модели вообще — сразу честный ответ.
             best_score = retrieved[0][1] if retrieved else 0.0
             if best_score < RELEVANCE_THRESHOLD:
                 answer = ("В документе нет информации по этому вопросу. "
@@ -110,11 +261,10 @@ if uploaded is not None:
         st.markdown("### 💬 Ответ")
         st.write(answer)
 
-        # Показываем, на каких фрагментах основан ответ (прозрачность RAG)
         with st.expander("🔎 На основе каких фрагментов документа (источники)"):
             for i, (chunk, score) in enumerate(retrieved, 1):
                 st.markdown(f"**Фрагмент {i}** (релевантность: {score:.3f})")
                 st.info(chunk)
 else:
     st.info("👆 Загрузите PDF-документ, чтобы начать. "
-            "Например: инструкцию, регламент техподдержки или методичку.")
+            "Например: инструкцию, регламент техподдержки или справочник.")
