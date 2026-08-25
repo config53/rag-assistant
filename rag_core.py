@@ -149,22 +149,53 @@ def build_user_prompt(context: str, question: str) -> str:
     )
 
 
+# Запас токенов на ответ. Qwen — «размышляющая» модель: она сначала пишет
+# ход рассуждений, и только потом сам ответ. Если лимит мал, токены уходят
+# на размышления, и до ответа модель не доходит.
+MAX_ANSWER_TOKENS = 3000
+
+
 def clean_answer(raw: str) -> str:
-    """Убирает блок рассуждений <think>...</think>, который добавляет модель Qwen."""
-    return re.sub(r"<think>.*?</think>", "", raw, flags=re.DOTALL).strip()
+    """
+    Убирает блок рассуждений <think>...</think>, который добавляют
+    «размышляющие» модели (Qwen и подобные).
+
+    Разбираются три случая:
+      1) блок закрыт  — берём всё, что идёт после последнего </think>;
+      2) блок не закрыт (ответ обрезали) — отбрасываем всё от <think> до конца;
+      3) блока нет     — возвращаем текст как есть.
+    """
+    text = (raw or "").strip()
+
+    if "</think>" in text:
+        text = text.rsplit("</think>", 1)[1].strip()
+    elif "<think>" in text:
+        text = text.split("<think>", 1)[0].strip()
+
+    return text
 
 
 def generate_answer(groq_client, question: str, retrieved: list,
                     model: str = "qwen/qwen3.6-27b") -> str:
-    """Собирает контекст из найденных чанков и просит LLM ответить по нему."""
+    """Собирает контекст из найденных фрагментов и просит LLM ответить по нему."""
     context = "\n\n---\n\n".join(chunk for chunk, score in retrieved)
-    response = groq_client.chat.completions.create(
-        messages=[
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": build_user_prompt(context, question)},
-        ],
-        model=model,
-        temperature=0.1,
-        max_tokens=500,
-    )
-    return clean_answer(response.choices[0].message.content)
+    messages = [
+        {"role": "system", "content": SYSTEM_PROMPT},
+        {"role": "user", "content": build_user_prompt(context, question)},
+    ]
+    params = dict(messages=messages, model=model,
+                  temperature=0.1, max_tokens=MAX_ANSWER_TOKENS)
+
+    # Groq умеет скрывать рассуждения модели на своей стороне (reasoning_format).
+    # Если модель или версия API не поддерживает параметр — повторяем запрос без него,
+    # а рассуждения вырежем сами в clean_answer().
+    try:
+        response = groq_client.chat.completions.create(**params, reasoning_format="hidden")
+    except Exception:
+        response = groq_client.chat.completions.create(**params)
+
+    answer = clean_answer(response.choices[0].message.content)
+    if not answer:
+        answer = ("Модель не успела сформулировать ответ. "
+                  "Попробуйте переформулировать вопрос короче и спросить ещё раз.")
+    return answer
